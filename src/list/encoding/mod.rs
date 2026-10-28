@@ -20,6 +20,29 @@ use rle::MergableSpan;
 use crate::encoding::varint::*;
 use num_enum::TryFromPrimitive;
 pub use encode_options::{EncodeOptions, EncodeOptionsBuilder, ENCODE_FULL, ENCODE_PATCH};
+pub use crate::encoding::parseerror::ParseError;
+
+/// Original envelope fields and the local range of all submitted operations.
+///
+/// Returned only after strict consumption and CRC validation. Metadata is copied from the
+/// original input, not a re-encoding. Frontiers use local versions in the returned staged log.
+#[derive(Debug, Clone)]
+pub struct StrictDecodeInfo {
+    /// Original document ID, if present.
+    pub doc_id: Option<String>,
+    /// Original opaque user data, including the distinction between absent and empty.
+    pub user_data: Option<Vec<u8>>,
+    /// Original agent-name declarations in wire order, including unused declarations.
+    pub agent_names: Vec<String>,
+    /// Original start frontier mapped into the staged log.
+    pub start_frontier: crate::Frontier,
+    /// Optional original start text. Not authenticated or checked against the base text.
+    pub start_content: Option<String>,
+    /// Frontier reached by this artifact.
+    pub end_frontier: crate::Frontier,
+    /// ALL submitted operations; none were trimmed as known.
+    pub submitted: crate::DTRange,
+}
 
 const MAGIC_BYTES: [u8; 8] = *b"DMNDTYPS";
 

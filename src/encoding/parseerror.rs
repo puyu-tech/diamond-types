@@ -45,6 +45,9 @@ pub enum ParseError {
 
     ChecksumFailed,
 
+    /// Strict new-artifact inspection found an already known operation ID.
+    KnownOperation,
+
     /// This error is interesting. We're loading a chunk but missing some of the data. In the future
     /// I'd like to explicitly support this case, and allow the oplog to contain a somewhat- sparse
     /// set of data, and load more as needed.

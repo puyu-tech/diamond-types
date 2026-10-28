@@ -179,6 +179,7 @@ impl<'a> ChunkReader<'a> {
             // Just read the string straight out.
             r.into_content_str()
         } else {
+            if self.1 { return Err(ParseError::LZ4DecoderNeeded); }
             let data_type = r.next_u32()?;
             if data_type != (DataType::PlainText as u32) {
                 return Err(ParseError::UnknownChunk);
@@ -193,12 +194,13 @@ impl<'a> ChunkReader<'a> {
         }
     }
 
-    fn read_fileinfo(&mut self, oplog: &mut ListOpLog) -> Result<FileInfoData<'_>, ParseError> {
-        let mut fileinfo = self.expect_chunk(ListChunkType::FileInfo)?.chunks();
+    fn read_fileinfo(&mut self, oplog: &mut ListOpLog) -> Result<FileInfoData<'a>, ParseError> {
+        let mut fileinfo = self.expect_chunk(ListChunkType::FileInfo)?.chunks_strict(self.1);
 
         let doc_id = fileinfo.read_chunk_if_eq(ListChunkType::DocId)?;
         let mut agent_names_chunk = fileinfo.expect_chunk(ListChunkType::AgentNames)?;
         let userdata = fileinfo.read_chunk_if_eq(ListChunkType::UserData)?;
+        if self.1 { fileinfo.expect_empty()?; }
 
         let doc_id = if let Some(doc_id) = doc_id {
             Some(doc_id.into_content_str()?)
@@ -211,8 +213,10 @@ impl<'a> ChunkReader<'a> {
         // 0 implicitly maps to ROOT.
         // let mut file_to_self_agent_map = vec![(ROOT_AGENT, 0)];
         let mut agent_map = Vec::new();
+        let mut agent_names = Vec::new();
         while !agent_names_chunk.0.is_empty() {
             let name = agent_names_chunk.next_str()?;
+            if self.1 { agent_names.push(name.to_owned()); }
             let id = oplog.get_or_create_agent_id(name);
             agent_map.push((id, 0));
         }
@@ -220,6 +224,7 @@ impl<'a> ChunkReader<'a> {
         Ok(FileInfoData {
             userdata,
             doc_id,
+            agent_names,
             agent_map,
         })
     }
@@ -231,6 +236,7 @@ impl<'a> ChunkReader<'a> {
 struct FileInfoData<'a> {
     userdata: Option<BufReader<'a>>,
     doc_id: Option<&'a str>,
+    agent_names: Vec<String>,
     agent_map: Vec<(AgentId, usize)>,
 }
 
@@ -380,17 +386,18 @@ impl<'a> HasLength for ContentItem<'a> {
 }
 
 impl<'a> ReadPatchContentIter<'a> {
-    fn new(mut chunk: BufReader<'a>, compressed: Option<&mut BufReader<'a>>) -> Result<(ListOpKind, Self), ParseError> {
+    fn new(mut chunk: BufReader<'a>, compressed: Option<&mut BufReader<'a>>, strict: bool) -> Result<(ListOpKind, Self), ParseError> {
         let tag = match chunk.next_u32()? {
             0 => Ins,
             1 => Del,
             _ => { return Err(ParseError::InvalidContent); }
         };
 
-        let mut chunk = chunk.chunks();
+        let mut chunk = chunk.chunks_strict(strict);
         let content = chunk.expect_content_str(compressed)?;
 
         let run_chunk = chunk.expect_chunk(ContentIsKnown)?;
+        if strict { chunk.expect_empty()?; }
 
         Ok((tag, Self { run_chunk, content }))
     }
@@ -443,6 +450,29 @@ impl Default for DecodeOptions {
 }
 
 impl ListOpLog {
+    /// Inspect a new artifact in a private clone using the existing native parser.
+    ///
+    /// The strict dialect is uncompressed protocol 0 with a required, checked final CRC.
+    /// Unknown/unsupported chunks and unconsumed payloads are rejected. Every submitted operation
+    /// must be new: any known span (even an exact replay or a known prefix) is rejected, including
+    /// repeated IDs inside this artifact. Handle exact outer-artifact duplicates separately.
+    ///
+    /// On success, `info.submitted` covers ALL submitted operations in the returned log. Callers
+    /// can inspect their original operations, ownership and parents with `iter_full_range` before
+    /// publishing the stage. Envelope fields are exposed for caller policy, not authenticated.
+    ///
+    /// # Errors
+    /// Returns a parse error for invalid strict input, unavailable bases or known operation spans.
+    /// `self` is never mutated, including on returned errors. Default decode/replay is unchanged.
+    ///
+    /// This is NOT a panic-safety or resource-bound guarantee: the native parser still contains
+    /// unchecked arithmetic, allocations and assertions.
+    pub fn decode_new_strict(&self, data: &[u8]) -> Result<(Self, StrictDecodeInfo), ParseError> {
+        let mut stage = self.clone();
+        let info = stage.decode_internal_mode(data, DecodeOptions::default(), true)?;
+        Ok((stage, info))
+    }
+
     pub fn load_from(data: &[u8]) -> Result<Self, ParseError> {
         let mut oplog = Self::new();
         oplog.decode_internal(data, DecodeOptions::default())?;
@@ -595,8 +625,13 @@ impl ListOpLog {
     /// TODO: Currently if this method returns an error, the local state is undefined & invalid.
     /// Until this is fixed, the signature of the method will stay kinda weird to prevent misuse.
     fn decode_internal(&mut self, data: &[u8], opts: DecodeOptions) -> Result<Frontier, ParseError> {
+        self.decode_internal_mode(data, opts, false).map(|info| info.end_frontier)
+    }
+
+    fn decode_internal_mode(&mut self, data: &[u8], opts: DecodeOptions, strict: bool) -> Result<StrictDecodeInfo, ParseError> {
         // Written to be symmetric with encode functions.
         let mut reader = BufReader(data);
+        let submitted_start = self.len();
 
         let verbose = ALLOW_VERBOSE && opts.verbose;
         if verbose {
@@ -610,7 +645,10 @@ impl ListOpLog {
         }
 
         // The rest of the file is made of chunks!
-        let mut reader = reader.chunks();
+        let mut reader = reader.chunks_strict(strict);
+        if strict && reader.0.peek_u32()? == Some(CompressedFieldsLZ4 as u32) {
+            return Err(ParseError::LZ4DecoderNeeded);
+        }
 
         // *** Compressed data ***
         // If there is a compressed chunk, it can contain data for other fields, all mushed
@@ -643,7 +681,7 @@ impl ListOpLog {
         // fileinfo has DocID, UserData and AgentNames.
         // The agent_map is a map from agent_id in the file to agent_id in self.
         let FileInfoData {
-            userdata: _userdata, doc_id, mut agent_map,
+            userdata, doc_id, agent_names, mut agent_map,
         } = reader.read_fileinfo(self)?;
 
         // If we already have a doc_id, make sure they match before merging.
@@ -657,37 +695,43 @@ impl ListOpLog {
         }
 
         // *** StartBranch ***
-        let mut start_branch = reader.expect_chunk(ListChunkType::StartBranch)?.chunks();
+        let mut start_branch = reader.expect_chunk(ListChunkType::StartBranch)?.chunks_strict(strict);
 
         // Start version - which if missing defaults to ROOT ([]).
         let start_version = start_branch.read_version(self, &agent_map)?;
+        let start_frontier = if strict { start_version.clone() } else { Frontier::root() };
 
         // The start branch also optionally contains the document content at this version. We can't
         // use it yet (NYI) but it needs to be parsed because it because it might be compressed.
-        if !start_branch.is_empty() {
-            let _start_content = start_branch.expect_content_str(compressed_chunk.as_mut())?;
+        let start_content = if !start_branch.is_empty() {
+            let content = start_branch.expect_content_str(compressed_chunk.as_mut())?;
             // dbg!(start_content);
             // TODO! Attach start_content if we're empty and start_version != ROOT.
-        }
+            Some(content)
+        } else { None };
+        if strict { start_branch.expect_empty()?; }
 
         // Usually the version data will be strictly separated. Either we're loading data into an
         // empty document, or we've been sent catchup data from a remote peer. If the data set
         // overlaps, we need to actively filter out operations & txns from that data set.
         // dbg!(&start_frontier, &self.frontier);
-        let patches_overlap = !local_frontier_eq(start_version.as_ref(), self.cg.version.as_ref());
+        let patches_overlap = strict || !local_frontier_eq(start_version.as_ref(), self.cg.version.as_ref());
         // dbg!(patches_overlap);
 
         // *** Patches ***
         let file_frontier = {
             // This chunk contains the actual set of edits to the document.
             let mut patch_chunk = reader.expect_chunk(ListChunkType::Patches)?
-                .chunks();
+                .chunks_strict(strict);
 
             let mut ins_content = None;
             let mut del_content = None;
 
             while let Some(chunk) = patch_chunk.read_chunk_if_eq(ListChunkType::PatchContent)? {
-                let (tag, content_chunk) = ReadPatchContentIter::new(chunk, compressed_chunk.as_mut())?;
+                let (tag, content_chunk) = ReadPatchContentIter::new(chunk, compressed_chunk.as_mut(), strict)?;
+                if strict && switch(tag, &ins_content, &del_content).is_some() {
+                    return Err(ParseError::InvalidContent);
+                }
                 // let iter = content_chunk.take_max();
                 let iter = content_chunk.buffered();
                 match tag {
@@ -760,6 +804,9 @@ impl ListOpLog {
                             }
                         } else { None };
 
+                        if strict && (max_len == 0 || (op.kind == Ins && content_here.is_none())) {
+                            return Err(ParseError::InvalidContent);
+                        }
                         assert!(max_len > 0);
                         n -= max_len;
 
@@ -790,6 +837,7 @@ impl ListOpLog {
                 if crdt_span.agent as usize >= self.cg.agent_assignment.client_data.len() {
                     return Err(ParseError::InvalidLength);
                 }
+                if strict && crdt_span.is_empty() { return Err(ParseError::InvalidLength); }
 
                 if patches_overlap {
                     // Sooo, if the current document overlaps with the data we're loading, we need
@@ -811,6 +859,7 @@ impl ListOpLog {
                         let len = consume_here.len();
 
                         let keep = if let Some(overlap_start) = overlap_start {
+                            if strict { return Err(ParseError::KnownOperation); }
                             let overlap = (overlap_start .. overlap_start + len).into();
                             // There's overlap. We'll filter out this item.
                             version_map.push_rle(KVPair(next_file_time, overlap));
@@ -860,6 +909,8 @@ impl ListOpLog {
                 }
             }
 
+            let file_ops_end = next_file_time;
+            if strict && patches_iter.next().is_some() { return Err(ParseError::InvalidLength); }
             next_file_time = new_op_start;
             // dbg!(&version_map);
             let mut next_history_time = first_new_time;
@@ -868,6 +919,9 @@ impl ListOpLog {
 
             while !history_chunk.is_empty() {
                 let mut entry = history_chunk.next_history_entry(self, next_file_time, &agent_map)?;
+                if strict && (entry.is_empty() || entry.span.end > file_ops_end) {
+                    return Err(ParseError::InvalidLength);
+                }
                 // So at this point the entry has underwater entry spans, and parents are underwater
                 // when they're local to the file (and non-underwater when they refer to our items).
                 // This makes the entry safe to truncate(), but we need to map it before we can use
@@ -945,7 +999,12 @@ impl ListOpLog {
 
         // TODO: Move checksum check to the start, so if it fails we don't modify the document.
         let reader_len = reader.0.len();
-        if let Some(mut crc_reader) = reader.read_chunk_if_eq(ListChunkType::Crc)? {
+        let crc = if strict {
+            Some(reader.expect_chunk(ListChunkType::Crc)?)
+        } else {
+            reader.read_chunk_if_eq(ListChunkType::Crc)?
+        };
+        if let Some(mut crc_reader) = crc {
             // So this is a bit dirty. The bytes which have been checksummed is everything up to
             // (but NOT INCLUDING) the CRC chunk. I could adapt BufReader to store the offset /
             // length. But we can just subtract off the remaining length from the original data??
@@ -959,11 +1018,21 @@ impl ListOpLog {
                     return Err(ParseError::ChecksumFailed);
                 }
             }
+            if strict { crc_reader.expect_empty()?; }
         }
+        if strict { reader.expect_empty()?; }
 
         // self.frontier = end_frontier_chunk.read_full_frontier(&self)?;
 
-        Ok(file_frontier)
+        Ok(StrictDecodeInfo {
+            doc_id: if strict { doc_id.map(str::to_owned) } else { None },
+            user_data: if strict { userdata.map(|r| r.0.to_vec()) } else { None },
+            agent_names,
+            start_frontier,
+            start_content: if strict { start_content.map(str::to_owned) } else { None },
+            end_frontier: file_frontier,
+            submitted: (submitted_start..self.len()).into(),
+        })
     }
 }
 

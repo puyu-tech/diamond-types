@@ -114,7 +114,11 @@ impl<'a> BufReader<'a> {
 
     #[inline]
     pub(super) fn chunks(self) -> ChunkReader<'a> {
-        ChunkReader(self)
+        self.chunks_strict(false)
+    }
+
+    pub(super) fn chunks_strict(self, strict: bool) -> ChunkReader<'a> {
+        ChunkReader(self, strict)
     }
 
     // Note the result is attached to the lifetime 'a, not the lifetime of self.
@@ -182,7 +186,7 @@ impl<'a> BufReader<'a> {
 
 /// A ChunkReader is a wrapper around some bytes which just contain a series of chunks.
 #[derive(Debug, Clone)]
-pub(super) struct ChunkReader<'a>(pub BufReader<'a>);
+pub(super) struct ChunkReader<'a>(pub BufReader<'a>, pub bool);
 
 impl<'a> Iterator for ChunkReader<'a> {
     type Item = Result<(ListChunkType, BufReader<'a>), ParseError>;
@@ -227,7 +231,7 @@ impl<'a> ChunkReader<'a> {
         loop {
             let c = self.next_chunk_raw();
             match c {
-                Err(ParseError::UnknownChunk) => {}, // Keep scanning.
+                Err(ParseError::UnknownChunk) if !self.1 => {}, // Keep scanning.
                 _ => { return c; }
             }
         }
